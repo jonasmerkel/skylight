@@ -106,9 +106,13 @@ export class ControlLoop {
   /** Zoom ladder rung (0 = full wide); climbs as vision lock sustains. */
   private ladderIdx = 0;
   private lastLadderAt = 0;
-  /** Focus-on-plane state: zoom units at the last one-push AF, and when. */
+  /** Focus-on-plane state: zoom units at the last one-push AF, and when.
+   *  lastFocusZoom: >0 = focused at that zoom; 0 = unfocused/reset; -1 = a sweep
+   *  failed and we fell back to the infinity stop (re-arm on the next clean frame). */
   private lastFocusZoom = 0;
   private lastFocusAt = 0;
+  /** When the last one-push AF was fired (0 = none pending a result check). */
+  private focusCheckAt = 0;
   /**
    * Recent aim/prediction history so vision can reference the pose AT FRAME
    * TIME — frames lag ~0.7 s, and measuring a blob in an old frame against
@@ -301,6 +305,7 @@ export class ControlLoop {
     this.lastLadderAt = 0;
     this.lastFocusZoom = 0;
     this.lastFocusAt = 0;
+    this.focusCheckAt = 0;
     this.panRateI = 0;
     this.tiltRateI = 0;
     this.lastPanRateCmd = 0;
@@ -481,24 +486,51 @@ export class ControlLoop {
 
       // Focus strategy:
       //  - Zoomed in AND vision-locked on the plane: one-push autofocus ON
-      //    THE PLANE, re-fired after each zoom step settles. The lens is not
-      //    parfocal, so the fixed infinity far-stop softens at high zoom;
-      //    focusing on the actual (now frame-filling, centered) subject is the
-      //    only reliable way to stay sharp toward 20×.
+      //    THE PLANE. The lens is not parfocal, so the fixed infinity far-stop
+      //    softens at high zoom; focusing on the actual subject is the only way
+      //    to stay sharp toward 20×. BUT fire the sweep only once the framing
+      //    has SETTLED (the zoom ladder isn't still stepping) and the plane is
+      //    sitting on the centre AF zone with the camera keeping up — a sweep
+      //    fired mid-ladder or with the plane off-centre makes contrast-AF lock
+      //    the blank sky / a passing cloud and rack the lens (the "can't find
+      //    focus at high zoom" hunt). After a sweep, if the plane is no longer
+      //    being detected the AF defocused it, so fall back to the infinity
+      //    far-stop: stable and only mildly soft, never hunting. Re-arm on the
+      //    next clean, centred frame.
       //  - Otherwise: infinity far-stop when meaningfully zoomed (a long lens
       //    on open sky makes autofocus hunt), autofocus at wide (hyperfocal
       //    depth covers everything and the plane is too small to lock).
       const zoomedIn = zoom.hfovDeg < 25;
+      const fdet = this.lastDetection;
+      const fFresh = fdet != null && now - fdet.t < 1000;
+      const fCentered =
+        fFresh && Math.abs(fdet.cx - 0.5) < 0.18 && Math.abs(fdet.cy - 0.5) < 0.18;
+      const fZoomSettled = now - this.lastLadderAt > 1200; // ladder not stepping
+      const fSteady = lagDeg < Math.max(0.4 * hfovDeg, 0.5); // camera keeping up
       if (zoomedIn && visionLocked && cfg.vision.autofocusOnZoom) {
-        const zoomMoved = Math.abs(zoom.zoomUnits - this.lastFocusZoom) > 60;
-        if ((this.lastFocusZoom === 0 || zoomMoved) && now - this.lastFocusAt > 1500) {
+        const zoomChanged = Math.abs(zoom.zoomUnits - this.lastFocusZoom) > 120;
+        const wantFocus = this.lastFocusZoom <= 0 || zoomChanged;
+        if (
+          wantFocus && fCentered && fSteady && fZoomSettled &&
+          now - this.lastFocusAt > 2000
+        ) {
           d.onePushAutofocus();
           this.lastFocusZoom = zoom.zoomUnits;
           this.lastFocusAt = now;
+          this.focusCheckAt = now;
+        } else if (this.focusCheckAt > 0 && now - this.focusCheckAt > 2500) {
+          // The sweep has had time to settle; if the plane dropped out of
+          // detection the AF lost it — park at infinity and re-arm.
+          if (!fFresh) {
+            d.setFocusInfinity(true);
+            this.lastFocusZoom = -1;
+          }
+          this.focusCheckAt = 0;
         }
       } else {
         d.setFocusInfinity(zoomedIn);
         this.lastFocusZoom = 0; // re-arm one-push AF for the next lock
+        this.focusCheckAt = 0;
       }
 
       const cmd: CameraPose = { ...pt, zoomUnits: zoom.zoomUnits };
