@@ -3,6 +3,11 @@
 import type { ProjectionMode } from "./config.js";
 
 const M_PER_MILE = 1609.34;
+
+/** Signed decimal degrees, e.g. `37.6213, -122.3790`. */
+export function formatLatLon(lat: number, lon: number): string {
+  return `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+}
 const KT_TO_MS = 0.514444;
 const DEG = Math.PI / 180;
 

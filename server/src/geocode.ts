@@ -3,6 +3,8 @@
 // cities, and airport codes. Kept dependency-free and unit-testable; the network
 // piece takes an injectable endpoint so tests never hit the real service.
 
+import { formatLatLon } from "@shared/geo.js";
+
 export interface GeoResult {
   lat: number;
   lon: number;
@@ -27,7 +29,7 @@ export function parseCoords(q: string): GeoResult | null {
   const lat = Number(m[1]);
   const lon = Number(m[2]);
   if (!validLatLon(lat, lon)) return null;
-  return { lat, lon, name: `${lat.toFixed(4)}, ${lon.toFixed(4)}` };
+  return { lat, lon, name: formatLatLon(lat, lon) };
 }
 
 export interface GeocodeOpts {

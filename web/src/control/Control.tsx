@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Config, ShowFields } from "@shared/index.js";
+import { formatLatLon } from "@shared/geo.js";
 import { useStream } from "../lib/useStream.js";
 import { nextISSPass, type Tle } from "../display/celestial.js";
 import { ColorRow, Row, Section, Segmented, Slider, TextInput, Toggle } from "./components.js";
@@ -14,12 +15,6 @@ function fmtIn(ms: number): string {
   const m = Math.max(0, Math.round(ms / 60000));
   if (m < 60) return `${m}m`;
   return `${Math.floor(m / 60)}h ${m % 60}m`;
-}
-
-function fmtLatLon(lat: number, lon: number): string {
-  const ns = lat >= 0 ? "N" : "S";
-  const ew = lon >= 0 ? "E" : "W";
-  return `${Math.abs(lat).toFixed(4)}° ${ns}, ${Math.abs(lon).toFixed(4)}° ${ew}`;
 }
 
 const FIELD_LABELS: Record<keyof ShowFields, string> = {
@@ -135,7 +130,7 @@ export function Control() {
 
       <main>
         <Section title="Location">
-          <Row label={cfg.locationName || "Location"} hint={fmtLatLon(cfg.centerLat, cfg.centerLon)}>
+          <Row label={cfg.locationName || "Location"} hint={formatLatLon(cfg.centerLat, cfg.centerLon)}>
             <div className="loc-bar">
               <TextInput
                 key={cfg.locationName}
