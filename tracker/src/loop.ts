@@ -35,8 +35,13 @@ import { planPass, zenithHold, ZENITH_MIN_HFOV } from "./pointing/planner.js";
 import { predictAim, TrackHistory, type Prediction } from "./pointing/predict.js";
 import { selectTarget, type CurrentTarget } from "./pointing/target.js";
 import { chooseZoom } from "./pointing/zoom.js";
-import { detectCandidatesInJpeg, type Detection } from "./vision/detect.js";
-import { PlaneNet } from "./vision/net.js";
+import { decodeLuma, VISION_W, VISION_H, type Detection } from "./vision/detect.js";
+import {
+  estimateShift,
+  compensatedResidual,
+  findMovingBlobs,
+  maskBelowHorizon,
+} from "./vision/motion.js";
 import { TrackTable, type WorldObs } from "./vision/tracks.js";
 import type { Recorder } from "./record.js";
 import type { Upstream } from "./upstream.js";
@@ -44,8 +49,6 @@ import type { VideoStream } from "./video/stream.js";
 
 const TRACKER_DIR = dirname(fileURLToPath(import.meta.url));
 const AUTOCAL_FILE = resolve(TRACKER_DIR, "../data/autocal.json");
-/** Repo root — config model paths ("tracker/models/…") resolve against it. */
-const APP_ROOT = resolve(TRACKER_DIR, "../..");
 
 export class ControlLoop {
   private mode: TrackerMode = "auto";
@@ -96,11 +99,9 @@ export class ControlLoop {
   /** Continuous auto-calibration from locked passes. */
   private autoCal = new AutoCalibrator(AUTOCAL_FILE);
   private lastAutoCalAt = 0;
-  /** Optional neural airplane detector (no-op until a model is installed). */
-  private net: PlaneNet | null = null;
-  private netTick = 0;
-  /** Net detections from the most recent net frame, frame fractions + score. */
-  private netDets: { cx: number; cy: number; box: { x: number; y: number; w: number; h: number }; score: number }[] = [];
+  /** Previous vision frame (luma) + its pose, for motion-compensated diffing. */
+  private prevLuma: Uint8Array | null = null;
+  private prevAim: { azDeg: number; elDeg: number; hfov: number } | null = null;
   /** Since when the detection has been continuously near center (0 = not). */
   private visionGoodSince = 0;
   /** Zoom ladder rung (0 = full wide); climbs as vision lock sustains. */
@@ -300,7 +301,8 @@ export class ControlLoop {
     // previous plane must not smear onto the new one.
     this.lastDetection = null;
     this.tracks.reset();
-    this.netDets = [];
+    this.prevLuma = null;
+    this.prevAim = null;
     this.corrAz = 0;
     this.corrEl = 0;
     this.corrAzApp = 0;
@@ -841,14 +843,7 @@ export class ControlLoop {
           };
         }),
         autoCal: cfg.vision.autoCalibrate ? this.autoCal.status(cfg.mount) : undefined,
-        net: cfg.vision.net?.enabled
-          ? {
-              enabled: true,
-              ready: this.net?.ready ?? false,
-              detections: this.netDets.length,
-              error: this.net?.error ?? undefined,
-            }
-          : undefined,
+        net: undefined, // retired: motion-compensated detection replaced it
       },
       site: cfg.site,
       upstream: {
@@ -856,23 +851,6 @@ export class ControlLoop {
         aircraftCount: this.upstream.getAircraft().length,
       },
     };
-  }
-
-  /** Create/refresh the neural detector to match config (no-op if disabled). */
-  private ensureNet(cfg: TrackerConfig): PlaneNet | null {
-    const nc = cfg.vision.net;
-    if (!nc?.enabled) {
-      this.net = null;
-      return null;
-    }
-    const modelPath = resolve(APP_ROOT, nc.modelPath);
-    const want = { enabled: true, modelPath, inputSize: nc.inputSize, scoreThresh: nc.scoreThresh, classId: nc.classId };
-    // Recreate only when the model identity changes.
-    if (!this.net || (this.net as unknown as { cfg: { modelPath: string } }).cfg.modelPath !== modelPath) {
-      this.net = new PlaneNet(want);
-    }
-    void this.net.ensureLoaded();
-    return this.net;
   }
 
   /** Aim/prediction history entry nearest a timestamp. */
@@ -899,7 +877,8 @@ export class ControlLoop {
     if (!cfg.vision.enabled || !tracking) {
       this.lastDetection = null;
       this.tracks.reset();
-      this.netDets = [];
+      this.prevLuma = null;
+      this.prevAim = null;
       this.corrAz = 0;
       this.corrEl = 0;
       return;
@@ -945,59 +924,54 @@ export class ControlLoop {
       exY = clamp01(0.5 - (predicted.elDeg - aim.elDeg) / vfov);
     }
 
-    // Tight-follow at native resolution: a distant plane is 3-6 px on the
-    // full-frame downscale; cropping the search to an ROI around the
-    // expectation keeps detector pixels ~native (≈2.7× finer at 720p).
-    // Zoomed in, the plane is big and may overflow a crop — stay full-frame.
-    const wide = hfov > 25;
-    // Big-plane regime: when the predicted angular size is a real fraction of
-    // the frame (close/overhead), or zoomed in, the speck detector is blind —
-    // run the large-object path too. ROI mode would crop a big plane, so the
-    // large path only runs full-frame.
-    const angSizeDeg = this.lastState?.target.angularSizeDeg ?? 0;
-    const bigInFrame = angSizeDeg / hfov > 0.03;
-    const useRoi = lockedBefore != null && wide && !bigInFrame;
-    const detectLarge = !useRoi && (bigInFrame || !wide || lockedBefore == null);
-    const roi = useRoi
-      ? { x: exX - 0.1875, y: exY - 0.1875, w: 0.375, h: 0.375 }
-      : undefined;
-
     this.visionBusy = true;
     try {
-      const cands = await detectCandidatesInJpeg(
-        frame,
-        {
+      // --- camera-motion-compensated detection ---
+      // Decode this frame and diff it against the previous one AFTER cancelling
+      // the camera's KNOWN motion: the world-static sky / cloud / haze / ground
+      // clutter subtracts to noise, and the plane is the residual that moved
+      // against it. No contrast machinery, no neural net — just a seeded shift
+      // search, a subtract, a horizon mask, and a blob find. The world-velocity
+      // tracker (below) still arbitrates which residual is the plane.
+      const cur = await decodeLuma(frame);
+      let cands: Detection[] = [];
+      const prev = this.prevLuma;
+      const prevAim = this.prevAim;
+      if (prev && prevAim && prev.length === cur.length) {
+        // Seed the background-shift search with the known aim delta between the
+        // two frames (camera moves -> world shifts the opposite way in frame);
+        // a tiny ±6 px refine absorbs pose lag / lens distortion.
+        const cosE0 = Math.max(0.2, Math.cos((aim.elDeg * Math.PI) / 180));
+        const seedDx = Math.round(
+          ((-norm180(aim.azDeg - prevAim.azDeg) * cosE0 * sign) / Math.max(1, hfov)) * VISION_W,
+        );
+        const seedDy = Math.round(((aim.elDeg - prevAim.elDeg) / Math.max(1, vfov)) * VISION_H);
+        const shift = estimateShift(prev, cur, VISION_W, VISION_H, seedDx, seedDy, 6);
+        const resid = compensatedResidual(prev, cur, VISION_W, VISION_H, shift);
+        // The plane is always above the horizon; drop the ground (known from
+        // tilt) so rooftops/poles/trees never become false movers.
+        maskBelowHorizon(resid, VISION_W, VISION_H, aim.elDeg, vfov, 2);
+        const blobs = findMovingBlobs(resid, VISION_W, VISION_H, 5, {
           expectedX: exX,
           expectedY: exY,
-          // Moderate leash while locked; wider when searching. The track
-          // table does the discrimination now — the leash only bounds the
-          // detector's search, it no longer picks the winner.
-          maxDistFrac: lockedBefore ? 0.22 : 0.32,
-          // Sky-mask only while wide; zoomed in, the frame IS sky and a big
-          // plane would mask itself.
-          useMask: wide && !bigInFrame,
-          // Area limits live in detector px — ~7× finer in ROI mode.
-          minArea: useRoi ? 2 : 1,
-          maxArea: useRoi ? 4000 : wide ? 600 : 5000,
-          // Complement the speck path with the large-object detector when the
-          // plane is (or may be) big in frame.
-          detectLarge,
-        },
-        roi,
-      );
-      // Neural airplane pass (throttled): the semantic signal the blob paths
-      // lack. Runs on the same frame; its boxes get fused below — confirming
-      // real blobs and seeding observations for planes the blob detector
-      // missed. No-op (netDets stays []) until a model is installed.
-      const net = this.ensureNet(cfg);
-      if (net && net.ready) {
-        const everyN = Math.max(1, cfg.vision.net.everyNTicks || 1);
-        if (this.netTick++ % everyN === 0) {
-          this.netDets = await net.detect(frame);
-        }
-      } else {
-        this.netDets = [];
+          maxDistFrac: lockedBefore ? 0.22 : 0.45,
+          minPeakSigma: 5,
+        });
+        cands = blobs.map((b) => {
+          const bw = Math.max(0.012, Math.sqrt(Math.max(1, b.areaPx)) / VISION_W);
+          return {
+            cx: b.cx,
+            cy: b.cy,
+            areaPx: b.areaPx,
+            contrastSigma: b.peakSigma,
+            box: { x: b.cx - bw / 2, y: b.cy - bw / 2, w: bw, h: bw },
+            score: b.peakSigma,
+          };
+        });
       }
+      // Roll the frame buffer forward for the next tick's diff.
+      this.prevLuma = cur;
+      this.prevAim = { azDeg: aim.azDeg, elDeg: aim.elDeg, hfov };
 
       const now = Date.now();
       const atFrame = this.aimAt(frameT);
@@ -1029,35 +1003,12 @@ export class ControlLoop {
       });
       const obs: WorldObs[] = cands.map((c) => {
         const w = toWorld(c.cx, c.cy);
-        // A blob that falls inside a neural airplane box inherits its score.
-        const hit = this.netDets.find(
-          (nd) => Math.abs(nd.cx - c.cx) < nd.box.w / 2 + 0.02 &&
-                  Math.abs(nd.cy - c.cy) < nd.box.h / 2 + 0.02,
-        );
         return {
           t: frameT, azDeg: w.azDeg, elDeg: w.elDeg,
           cx: c.cx, cy: c.cy, box: c.box,
           contrastSigma: c.contrastSigma, areaPx: c.areaPx,
-          netScore: hit?.score,
         };
       });
-      // Neural detections with NO matching blob still seed observations — a
-      // big/faint plane the blob paths missed enters as an airplane track.
-      for (const nd of this.netDets) {
-        const matched = cands.some(
-          (c) => Math.abs(nd.cx - c.cx) < nd.box.w / 2 + 0.02 &&
-                 Math.abs(nd.cy - c.cy) < nd.box.h / 2 + 0.02,
-        );
-        if (matched) continue;
-        const w = toWorld(nd.cx, nd.cy);
-        obs.push({
-          t: frameT, azDeg: w.azDeg, elDeg: w.elDeg,
-          cx: nd.cx, cy: nd.cy, box: nd.box,
-          contrastSigma: 6, // net-confirmed: treat as solid contrast
-          areaPx: Math.round(nd.box.w * nd.box.h * 480 * 270),
-          netScore: nd.score,
-        });
-      }
 
       // Associate into tracks; pick the lock by MOTION against the
       // prediction. Clouds lose on velocity even when brighter and closer.

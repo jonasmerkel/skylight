@@ -57,6 +57,22 @@ export interface DetectOptions {
 
 const W = 480;
 const H = 270;
+
+/** Working resolution of the vision pipeline (luma + motion residual). */
+export const VISION_W = W;
+export const VISION_H = H;
+
+/** Decode a JPEG frame to a W×H grayscale luma buffer (the motion detector's
+ *  input). One sharp pass; reused frame-to-frame for temporal differencing. */
+export async function decodeLuma(jpeg: Buffer): Promise<Uint8Array> {
+  const { data } = await sharp(jpeg)
+    .resize(W, H, { fit: "fill" })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  return new Uint8Array(data.buffer, data.byteOffset, data.length);
+}
+
 /** Background grid block size (detector pixels). */
 const BLOCK = 24;
 /** Sky-mask energy blur radius (detector pixels). A plane-sized speck
