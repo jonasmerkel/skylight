@@ -2,10 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "@shared/index.js";
 import { Poller, type PollerOptions } from "../src/datasource.js";
 import type { RouteEnricher } from "../src/enrich/routes.js";
+import { resetAirplanesLiveGate } from "../src/airplanes-live.js";
 
-// Regression test for #15: when the API is the *primary* source, the supplement
-// timer must not also poll it — the double request rate trips airplanes.live's
-// rate limit and makes aircraft flicker out and back.
+// Regression test for #15: polling airplanes.live must never exceed its 1 req/s
+// limit — the double request rate trips the limit and makes aircraft flicker
+// out and back. Two defenses: the supplement timer is torn down when the API is
+// the *primary* source, and a shared rate gate serializes every airplanes.live
+// request so their combined rate stays within the limit even if timers drift.
 
 const stubEnricher = { enrichSync: () => ({}) } as unknown as RouteEnricher;
 
@@ -29,6 +32,7 @@ describe("Poller supplement-timer lifecycle (#15)", () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
+    resetAirplanesLiveGate();
     fetchSpy = vi.fn(async () => ({
       ok: true,
       json: async () => ({ aircraft: [] }),
@@ -41,28 +45,33 @@ describe("Poller supplement-timer lifecycle (#15)", () => {
     vi.useRealTimers();
   });
 
-  it("does not double-poll when the API is the primary source", async () => {
+  it("paces the API to the rate limit when it is the primary source", async () => {
     const poller = new Poller(makeOpts({ source: "api" }));
     poller.start();
-    await vi.advanceTimersByTimeAsync(4100); // 4 primary ticks, 0 supplement ticks
+    await vi.advanceTimersByTimeAsync(4100);
     poller.stop();
-    // 1 immediate + 4 interval ticks = 5; a stray supplement timer would add more.
-    expect(fetchSpy).toHaveBeenCalledTimes(5);
+    // The gate's ~1s spacing lets ticks through at 0, 1050, 2100, 3150 — four in
+    // 4100ms, never the five a raw 1s poll interval would otherwise fire.
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
   });
 
   it("runs the supplement timer only while radio is primary", async () => {
     const poller = new Poller(makeOpts({ source: "radio" }));
     poller.start();
-    await vi.advanceTimersByTimeAsync(0); // flush immediate radio + supplement polls
+    await vi.advanceTimersByTimeAsync(1); // flush immediate radio + supplement polls
     const afterStart = fetchSpy.mock.calls.length;
     expect(afterStart).toBeGreaterThanOrEqual(2); // radio tick + supplement refresh
 
-    // Switching to API should tear the supplement timer down.
+    // Switching to API should tear the supplement timer down; the gate then
+    // caps the primary poll on its own.
     poller.setSource("api");
+    resetAirplanesLiveGate(); // measure the post-switch window in isolation
     fetchSpy.mockClear();
     await vi.advanceTimersByTimeAsync(4100);
     poller.stop();
-    // 4 primary interval ticks over 4100ms; a live supplement timer would add ~1 more.
-    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    // No supplement doubling, and the gate holds the API to at most one request
+    // per ~1s over the window.
+    expect(fetchSpy.mock.calls.length).toBeLessThanOrEqual(4);
+    expect(fetchSpy.mock.calls.length).toBeGreaterThan(0);
   });
 });

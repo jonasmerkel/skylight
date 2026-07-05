@@ -34,15 +34,46 @@ interface CacheFile {
 
 export class RouteEnricher {
   private cache: CacheFile = { routes: {}, aircraft: {} };
-  private inflight = new Map<string, Promise<void>>();
+  // Keys currently queued or in flight, so we never enqueue a duplicate.
+  private inflight = new Set<string>();
+  // Serialized, rate-limited fetch queue: at most one request every
+  // `minIntervalMs` so a burst of new aircraft doesn't hammer the free API.
+  private queue: Array<() => Promise<void>> = [];
+  private pumping = false;
+  private minIntervalMs: number;
   private dirty = false;
   private ttlMs: number;
 
   constructor(
     private cachePath: string,
     ttlHours = 12,
+    minIntervalMs = 1000,
   ) {
     this.ttlMs = ttlHours * 3600_000;
+    this.minIntervalMs = minIntervalMs;
+  }
+
+  /** Enqueue a fetch task; the pump runs them one at a time, ≥1s apart. */
+  private enqueue(task: () => Promise<void>): void {
+    this.queue.push(task);
+    if (!this.pumping) void this.pump();
+  }
+
+  private async pump(): Promise<void> {
+    this.pumping = true;
+    try {
+      while (this.queue.length) {
+        const task = this.queue.shift()!;
+        const start = Date.now();
+        await task();
+        const wait = this.minIntervalMs - (Date.now() - start);
+        if (this.queue.length && wait > 0) {
+          await new Promise((r) => setTimeout(r, wait));
+        }
+      }
+    } finally {
+      this.pumping = false;
+    }
   }
 
   async load(): Promise<void> {
@@ -85,7 +116,8 @@ export class RouteEnricher {
   private fetchRoute(cs: string): void {
     const key = "r:" + cs;
     if (this.inflight.has(key)) return;
-    const p = (async () => {
+    this.inflight.add(key);
+    this.enqueue(async () => {
       try {
         const res = await fetch(`${API}/callsign/${encodeURIComponent(cs)}`, {
           signal: AbortSignal.timeout(8000),
@@ -115,14 +147,14 @@ export class RouteEnricher {
       } finally {
         this.inflight.delete(key);
       }
-    })();
-    this.inflight.set(key, p);
+    });
   }
 
   private fetchAircraft(hex: string): void {
     const key = "a:" + hex;
     if (this.inflight.has(key)) return;
-    const p = (async () => {
+    this.inflight.add(key);
+    this.enqueue(async () => {
       try {
         const res = await fetch(`${API}/aircraft/${encodeURIComponent(hex)}`, {
           signal: AbortSignal.timeout(8000),
@@ -145,8 +177,7 @@ export class RouteEnricher {
       } finally {
         this.inflight.delete(key);
       }
-    })();
-    this.inflight.set(key, p);
+    });
   }
 
   private async flush(): Promise<void> {

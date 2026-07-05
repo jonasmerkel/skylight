@@ -8,6 +8,7 @@
 // the last snapshot — the panel just shows slightly stale dots.
 
 import type { GroundAircraft } from "@shared/index.js";
+import { acquireAirplanesLive } from "./airplanes-live.js";
 
 const SFO_LAT = 37.6213;
 const SFO_LON = -122.379;
@@ -33,6 +34,7 @@ export class SfoGroundPoller {
   private timer: ReturnType<typeof setInterval> | null = null;
   private last: { at: number; aircraft: GroundAircraft[] } | null = null;
   private lastErrorLogAt = 0;
+  private polling = false;
 
   constructor(private onUpdate: (at: number, aircraft: GroundAircraft[]) => void) {}
 
@@ -53,7 +55,12 @@ export class SfoGroundPoller {
   }
 
   private async poll(): Promise<void> {
+    // A gated request can outlast the poll interval; don't stack a second run.
+    if (this.polling) return;
+    this.polling = true;
     try {
+      // Share airplanes.live's 1 req/s budget with the main poller.
+      await acquireAirplanesLive();
       const res = await fetch(URL, { signal: AbortSignal.timeout(5000) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = (await res.json()) as { ac?: AlAircraft[] };
@@ -86,6 +93,8 @@ export class SfoGroundPoller {
         this.lastErrorLogAt = now;
         console.warn(`[sfo-ground] poll failed: ${(err as Error).message}`);
       }
+    } finally {
+      this.polling = false;
     }
   }
 }

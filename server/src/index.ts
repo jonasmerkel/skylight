@@ -34,6 +34,10 @@ const ROUTE_CACHE_HOURS = Number(process.env.ROUTE_CACHE_HOURS ?? 12);
 // When on radio, also poll the API and merge (keeps landing aircraft alive).
 const SUPPLEMENT_API = (process.env.SUPPLEMENT_API ?? "1") !== "0";
 const API_POLL_MS = Number(process.env.API_POLL_MS ?? 4000);
+// SFO surface traffic is an SFO-specific panel for the Twitch stream. It's an
+// extra airplanes.live poller that shares the 1 req/s budget, so keep it opt-in
+// — off by default, it doesn't steal request slots from the main display.
+const SFO_GROUND = (process.env.SFO_GROUND ?? "0") === "1";
 // Nominatim asks for a descriptive User-Agent identifying the application.
 const GEOCODE_UA =
   process.env.GEOCODE_USER_AGENT ??
@@ -193,11 +197,12 @@ async function main(): Promise<void> {
   }
 
   poller.start();
-  sfoGround.start();
+  if (SFO_GROUND) sfoGround.start();
 
   server.listen(PORT, HOST, () => {
     console.log(`[server] listening on http://${HOST}:${PORT}`);
     console.log(`[server] data source: ${SOURCE} (${SOURCE === "radio" ? RADIO_URL : API_URL})`);
+    console.log(`[server] SFO ground poller: ${SFO_GROUND ? "on" : "off (set SFO_GROUND=1 to enable)"}`);
     console.log(`[server] control panel: http://<this-host>:${PORT}/control`);
     console.log(`[server] host allowlist: ${hostMatcher.describe()}`);
   });

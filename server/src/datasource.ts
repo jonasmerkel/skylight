@@ -7,6 +7,7 @@ import type { SourceStatus } from "@shared/index.js";
 import { llToMeters, metersToMiles, rangeMeters } from "@shared/index.js";
 import { lookupAirline, lookupType } from "./enrich/tables.js";
 import type { RouteEnricher } from "./enrich/routes.js";
+import { acquireAirplanesLive } from "./airplanes-live.js";
 
 /** Raw readsb-style aircraft record (subset we use). */
 interface RawAircraft {
@@ -158,6 +159,9 @@ export class Poller {
   private lastErrorLogAt = 0;
   /** After an HTTP 429, no API requests until this timestamp. */
   private apiBackoffUntil = 0;
+  /** Guards against overlapping runs while a fetch waits on the rate gate. */
+  private ticking = false;
+  private refreshingApi = false;
 
   constructor(private o: PollerOptions) {
     this.status = {
@@ -216,6 +220,9 @@ export class Poller {
   private async fetchList(source: DataSource, now: number): Promise<Aircraft[] | null> {
     const url = source === "radio" ? this.o.getConfig().radioUrl : this.buildApiUrl();
     try {
+      // Serialize airplanes.live requests with every other poller (supplement,
+      // SFO ground) so the aggregate rate stays within its 1 req/s limit.
+      if (source === "api") await acquireAirplanesLive();
       const json = await fetchJson(url);
       const rawList: RawAircraft[] = json.aircraft ?? json.ac ?? [];
       const list: Aircraft[] = [];
@@ -249,9 +256,15 @@ export class Poller {
   }
 
   private async refreshApi(): Promise<void> {
+    if (this.refreshingApi) return;
     if (Date.now() < this.apiBackoffUntil) return;
-    const list = await this.fetchList("api", Date.now());
-    if (list) this.lastApi = list;
+    this.refreshingApi = true;
+    try {
+      const list = await this.fetchList("api", Date.now());
+      if (list) this.lastApi = list;
+    } finally {
+      this.refreshingApi = false;
+    }
   }
 
   /** Keep only aircraft within the configured display radius. Position-less
@@ -276,41 +289,49 @@ export class Poller {
   }
 
   private async tick(): Promise<void> {
-    const now = Date.now();
-    if (this.o.source === "api" && now < this.apiBackoffUntil) {
-      const waitS = Math.ceil((this.apiBackoffUntil - now) / 1000);
+    // A gated API fetch can outlast the poll interval; don't let the next
+    // interval stack a second run on top of the one still waiting.
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      const now = Date.now();
+      if (this.o.source === "api" && now < this.apiBackoffUntil) {
+        const waitS = Math.ceil((this.apiBackoffUntil - now) / 1000);
+        this.status = {
+          ...this.status,
+          ok: false,
+          message: `API rate limited — retrying in ${waitS}s`,
+        };
+        this.o.onStatus(this.status);
+        return;
+      }
+      const primary = await this.fetchList(this.o.source, now);
+      if (primary === null) {
+        this.status = {
+          ...this.status,
+          ok: false,
+          message: this.lastError ?? "source fetch failed",
+        };
+        this.o.onStatus(this.status);
+        return;
+      }
+      const supplement = this.o.source === "radio" && this.o.supplementApi;
+      const merged = supplement ? mergeSources(primary, this.lastApi) : primary;
+      for (const ac of merged) this.enrich(ac, now);
+      this.last = merged;
+      this.pruneSticky(now);
       this.status = {
-        ...this.status,
-        ok: false,
-        message: `API rate limited — retrying in ${waitS}s`,
+        source: this.o.source,
+        ok: true,
+        count: merged.length,
+        lastOk: now,
+        message: supplement ? `radio + ${this.lastApi.length} via API` : undefined,
       };
+      this.o.onSnapshot(now, merged);
       this.o.onStatus(this.status);
-      return;
+    } finally {
+      this.ticking = false;
     }
-    const primary = await this.fetchList(this.o.source, now);
-    if (primary === null) {
-      this.status = {
-        ...this.status,
-        ok: false,
-        message: this.lastError ?? "source fetch failed",
-      };
-      this.o.onStatus(this.status);
-      return;
-    }
-    const supplement = this.o.source === "radio" && this.o.supplementApi;
-    const merged = supplement ? mergeSources(primary, this.lastApi) : primary;
-    for (const ac of merged) this.enrich(ac, now);
-    this.last = merged;
-    this.pruneSticky(now);
-    this.status = {
-      source: this.o.source,
-      ok: true,
-      count: merged.length,
-      lastOk: now,
-      message: supplement ? `radio + ${this.lastApi.length} via API` : undefined,
-    };
-    this.o.onSnapshot(now, merged);
-    this.o.onStatus(this.status);
   }
 
   private enrich(ac: Aircraft, now: number): void {
